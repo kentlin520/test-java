@@ -1,0 +1,175 @@
+# Docker
+# Build a Docker image
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+- master
+
+pool: AWS-Pool
+
+resources:
+  repositories:
+  - repository: helm-charts
+    type: git
+    name: OSI-DPF/helm-charts
+
+name: $(Date:yyyyMMdd).$(Rev:r)
+
+variables:
+  tag: '$(Build.BuildId)'
+  registry_url: 252862807637.dkr.ecr.ap-northeast-1.amazonaws.com
+  file_path: hello-java-0.0.1-SNAPSHOT.jar
+  base_image: alpine-openjdk8:202311 
+  env: UT
+  WS_APIKEY: 4d95ed97baa041059662865d0434db89c6dd70dd5f4d4773af8b54ea1cc514ad
+  WS_USERKEY: bdc4bd218e53449b93c55e14824eb0b90cff4ec0f6f24954acf5d398f85beba7
+  application_name: hello-java
+stages:
+- stage: checkmarx
+  displayName: 源碼掃描
+  jobs:
+  - job: checkmarx
+    displayName: Checkmarx scan
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Checkmarx AST@2
+      inputs:
+        CheckmarxService: 'DPF Client'
+        projectName: '$(Build.Repository.Name)'
+        branchName: '$(Build.SourceBranchName)'
+        tenantName: 'cathaybk'
+        additionalParams: '--scan-types sca --async'
+  - job: Mend
+    displayName:  Mend scan
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - script: |
+        curl -LJO https://unified-agent.s3.amazonaws.com/wss-unified-agent.jar
+        java -jar wss-unified-agent.jar
+      displayName: Mend scan
+      env:
+        WS_APIKEY: $(WS_APIKEY)
+        WS_USERKEY: $(WS_USERKEY)
+        WS_WSS_URL: https://saas.whitesourcesoftware.com/agent
+        WS_PRODUCTNAME: AZDO_$(System.TeamProject)
+        WS_PROJECTNAME: $(Build.Repository.Name)_$(Build.SourceBranchName)
+- stage: maven_build
+  pool:
+    vmImage: ubuntu-latest
+  displayName: 編譯 & 單元測試 & SBOM
+  jobs:
+  - job: maven_build
+    displayName: 編譯 & 單元測試
+    steps:
+    - task: Maven@3
+      displayName: '編譯Java'
+      inputs:
+        mavenPomFile: 'pom.xml'
+        mavenOptions: '-Xmx3072m'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.8'
+        jdkArchitectureOption: 'x64'
+        publishJUnitResults: true
+        goals: 'package org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom'
+    - task: CopyFiles@2
+      displayName: '複製Jar檔至Artifact'
+      inputs:
+        Contents: '**/*.jar'
+        TargetFolder: '$(build.artifactstagingdirectory)'
+    - task: CopyFiles@2
+      displayName: '複製Dockerfile至Artifact'
+      inputs:
+        Contents: 'Dockerfile'
+        TargetFolder: '$(build.artifactstagingdirectory)'
+    - task: Bash@3 
+      displayName: '安裝syft 環境'
+      inputs:
+        targetType: inline
+        script: |
+         curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+    - task: Bash@3 
+      displayName: '產生SBOM'
+      inputs:
+        targetType: inline
+        script: |
+          syft $(Build.ArtifactStagingDirectory)/target/*.jar -o cyclonedx-json > $(build.artifactstagingdirectory)/JarBom.json
+    - task: PublishBuildArtifacts@1
+      displayName: '發佈Artifacts'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        publishLocation: 'Container'
+        artifactName: 'drop'
+- stage: docker_build
+  displayName: 打包 & 推送 Image
+  jobs:
+  - job: docker_build
+    displayName: 打包 & 推送 Image
+    pool: AWS-Pool
+    steps:
+    - task: DownloadBuildArtifacts@0
+      displayName: '下載Artifacts'
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        downloadPath: '$(System.ArtifactsDirectory)'
+    - task: AWSShellScript@1
+      displayName: 'ECR Login'
+      inputs:
+          awsCredentials: AWS-ServiceConnection
+          regionName: ap-northeast-1
+          failOnStandardError: false
+          scriptType: 'inline'
+          inlineScript: |
+              aws ecr get-login-password --region ap-northeast-1 | podman login --username AWS --password-stdin $(registry_url)
+    - task: Bash@3 
+      displayName: '打包Container Image'
+      inputs:
+        targetType: inline
+        script: |
+         podman build --no-cache -f $(build.artifactstagingdirectory)/drop/Dockerfile $(build.artifactstagingdirectory)/drop/target -t $(registry_url)/$(application_name):$(Build.BuildNumber) --build-arg REGISTRY_URL=$(registry_url) --build-arg FILE_PATH=$(file_path) --build-arg BASE_IMAGE=$(base_image) --build-arg ENV=$(env)
+    - task: Bash@3 
+      displayName: '推送Image至AWS ECR'
+      inputs:
+        targetType: inline
+        script: |
+         podman push $(registry_url)/$(application_name):$(Build.BuildNumber)
+- stage: ut_deploy
+  displayName: 部署
+  jobs:
+  - job: helm_install
+    displayName: UT 部署
+    steps:
+    - checkout: helm-charts
+    - task: HelmInstaller@1
+      displayName: Helm installer
+      inputs: 
+        helmVersionToInstall: 3.12.0
+    - task: AWSShellScript@1
+      displayName: 'Pull Helm Chart'
+      inputs:
+          awsCredentials: AWS-ServiceConnection
+          regionName: ap-northeast-1
+          failOnStandardError: true
+          scriptType: 'inline'
+          inlineScript: |
+              # echo 'Using identity'
+              aws sts get-caller-identity
+              
+              # Get Kubeconfig
+              echo 'Connect to Amazon EKS cluster'
+              aws eks update-kubeconfig --region ap-northeast-1 --name poc-fido-cluster
+    - task: Bash@3 
+      displayName: 'Helm Deploy'
+      inputs:
+        targetType: inline
+        script: |
+          helm upgrade --namespace=default --set ipe-app.image.tag=$(Build.BuildNumber) --set ipe-app.registry=$(registry_url) -f ./default/$(application_name)/values-eks-ut.yaml $(application_name) ./default/$(application_name)
+    - task: Bash@3 
+      displayName: 'Helm template'
+      inputs:
+        targetType: inline
+        script: |
+          helm template ./default/$(application_name) -f ./default/$(application_name)/values-eks-ut.yaml --name-template=$(application_name) --set ipe-app.image.tag=$(Build.BuildNumber) --set ipe-app.registry=$(registry_url)
